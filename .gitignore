@@ -1,0 +1,19 @@
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.idea/
+
+# Model artifacts are generated locally and are not portable across targets.
+models/*.pt
+models/*.onnx
+models/*.engine
+models/*.plan
+models/*.cache
+
+# Runtime output
+output/
+*.log
