@@ -126,4 +126,5 @@ masks through Python unless they are truly needed there.
 - Prefer dropping stale camera frames over creating an unbounded queue.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the component boundary and
-planned milestones.
+planned milestones. If you are learning the implementation, follow
+[docs/LEARNING_PATH.md](docs/LEARNING_PATH.md) in order.
