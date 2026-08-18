@@ -1,0 +1,6 @@
+# One Basler serial per line.
+# File order is the fixed TensorRT batch-slot order.
+40123456
+40123457
+40123458
+40123459

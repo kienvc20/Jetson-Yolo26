@@ -16,13 +16,21 @@ struct InferenceStats {
     float inferenceMilliseconds{0.0F};
 };
 
+struct BatchImageView {
+    const std::uint8_t* bgr{nullptr};
+    int width{0};
+    int height{0};
+    int stride{0};
+};
+
 class Yolo26Seg {
 public:
     Yolo26Seg(
         const std::string& enginePath,
         int inputWidth,
         int inputHeight,
-        const std::string& inputName = "images");
+        const std::string& inputName = "images",
+        int batchSize = 1);
 
     ~Yolo26Seg();
 
@@ -35,9 +43,12 @@ public:
         int sourceHeight,
         int sourceStride);
 
+    InferenceStats inferBatch(const std::vector<BatchImageView>& images);
+
     std::vector<float> downloadFloatOutput(const std::string& bindingName);
     const std::vector<BindingInfo>& bindings() const noexcept { return engine_.bindings(); }
     LetterboxTransform lastTransform() const noexcept { return lastTransform_; }
+    int batchSize() const noexcept { return batchSize_; }
 
 private:
     void ensureSourceCapacity(std::size_t requiredBytes);
@@ -46,6 +57,7 @@ private:
     std::string inputName_;
     int inputWidth_;
     int inputHeight_;
+    int batchSize_{1};
     cudaStream_t stream_{nullptr};
     cudaEvent_t preprocessStart_{nullptr};
     cudaEvent_t preprocessEnd_{nullptr};
@@ -55,4 +67,4 @@ private:
     LetterboxTransform lastTransform_{};
 };
 
-}  // namespace y26
+} // namespace y26
