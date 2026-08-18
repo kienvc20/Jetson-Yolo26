@@ -32,4 +32,18 @@ void launchPreprocess(
     nvinfer1::DataType destinationType,
     cudaStream_t stream);
 
+// Preprocess one image directly into slot `batchIndex` of an already allocated
+// [N, 3, H, W] TensorRT input tensor.
+void launchPreprocessBatchSlot(
+    const std::uint8_t* sourceBgr,
+    int sourceWidth,
+    int sourceHeight,
+    int sourceStride,
+    void* destinationNchwBatch,
+    int batchIndex,
+    int destinationWidth,
+    int destinationHeight,
+    nvinfer1::DataType destinationType,
+    cudaStream_t stream);
+
 }  // namespace y26
