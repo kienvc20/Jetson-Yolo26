@@ -10,64 +10,68 @@ DynamicSegPipeline::DynamicSegPipeline(
     int inputWidth,
     int inputHeight,
     const std::string& inputName,
-    const std::string& primaryOutputName)
-    : model_(enginePath, inputWidth, inputHeight, inputName),
-      primaryOutputName_(primaryOutputName) {}
+    const std::string& primaryOutputName,
+    const std::vector<std::string>& configuredCameraIds)
+    : cameraIds_(configuredCameraIds),
+      model_(enginePath, inputWidth, inputHeight, inputName,
+             static_cast<int>(configuredCameraIds.size())),
+      primaryOutputName_(primaryOutputName) {
+    if (cameraIds_.empty()) {
+        throw std::invalid_argument("At least one configured camera is required");
+    }
+}
 
-std::vector<SegmentationResult> DynamicSegPipeline::process(
-    const std::vector<CameraFrame>& readyFrames) {
-    std::vector<SegmentationResult> results;
-    results.reserve(readyFrames.size());
+std::vector<SegmentationResult> DynamicSegPipeline::processFixedBatch(
+    const std::vector<CameraFrame>& frames) {
+    if (frames.size() != cameraIds_.size()) {
+        throw std::invalid_argument("Fixed batch must contain exactly one frame per configured camera");
+    }
 
-    // Dynamic camera set: the caller passes only cameras that produced a fresh
-    // frame in this scheduling cycle. A slow/disconnected camera does not block
-    // the others. The current TensorRT runtime is batch-1, so frames share one
-    // model instance and are scheduled sequentially. This boundary is designed
-    // to be replaced by true dynamic TensorRT batching once the engine is built
-    // with a dynamic N optimization profile.
-    for (const CameraFrame& frame : readyFrames) {
-        if (frame.bgr == nullptr) {
-            continue;
+    std::vector<BatchImageView> images;
+    images.reserve(frames.size());
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        const CameraFrame& frame = frames[i];
+        if (frame.cameraId != cameraIds_[i]) {
+            throw std::invalid_argument("Camera frame order does not match configured batch slots");
         }
-        results.push_back(processOne(frame));
+        images.push_back(BatchImageView{
+            frame.bgr, frame.width, frame.height, frame.stride});
+    }
+
+    const InferenceStats stats = model_.inferBatch(images);
+    const std::vector<float> output = model_.downloadFloatOutput(primaryOutputName_);
+
+    if (output.size() % frames.size() != 0) {
+        throw std::runtime_error("Primary output cannot be evenly split across fixed camera batch");
+    }
+
+    const std::size_t valuesPerImage = output.size() / frames.size();
+    std::vector<SegmentationResult> results;
+    results.reserve(frames.size());
+
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        SegmentationResult result;
+        result.cameraId = frames[i].cameraId;
+        result.sequence = frames[i].sequence;
+        result.preprocessMs = stats.preprocessMilliseconds;
+        result.inferenceMs = stats.inferenceMilliseconds;
+        result.outputValues = valuesPerImage;
+
+        const float* begin = output.data() + i * valuesPerImage;
+        basicPostprocess(begin, begin + valuesPerImage, result);
+        results.push_back(result);
     }
     return results;
 }
 
-SegmentationResult DynamicSegPipeline::processOne(const CameraFrame& frame) {
-    if (frame.width <= 0 || frame.height <= 0 || frame.stride < frame.width * 3) {
-        throw std::invalid_argument("Invalid camera frame");
-    }
-
-    const InferenceStats stats = model_.infer(
-        frame.bgr, frame.width, frame.height, frame.stride);
-
-    const std::vector<float> output =
-        model_.downloadFloatOutput(primaryOutputName_);
-
-    SegmentationResult result;
-    result.cameraId = frame.cameraId;
-    result.sequence = frame.sequence;
-    result.preprocessMs = stats.preprocessMilliseconds;
-    result.inferenceMs = stats.inferenceMilliseconds;
-    result.outputValues = output.size();
-    basicPostprocess(output, result);
-    return result;
-}
-
 void DynamicSegPipeline::basicPostprocess(
-    const std::vector<float>& output,
+    const float* begin,
+    const float* end,
     SegmentationResult& result) {
-    // Intentionally model-agnostic smoke-test postprocess. YOLO26-seg output
-    // layout must be inspected before implementing box/NMS/prototype masks.
-    // For now report the largest finite-ish score-like value and its index.
-    if (output.empty()) {
-        return;
-    }
-
-    const auto it = std::max_element(output.begin(), output.end());
+    if (begin == end) return;
+    const float* it = std::max_element(begin, end);
     result.bestScore = *it;
-    result.bestClass = static_cast<int>(std::distance(output.begin(), it));
+    result.bestIndex = static_cast<int>(it - begin);
 }
 
 } // namespace y26
