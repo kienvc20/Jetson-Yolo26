@@ -13,6 +13,8 @@ def parse_args():
     )
     parser.add_argument("--weights", default="yolo26n-seg.pt")
     parser.add_argument("--imgsz", type=int, default=512)
+    parser.add_argument("--batch", type=int, default=1,
+                        help="Static batch size; set this to configured camera count")
     parser.add_argument("--opset", type=int, default=13)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -20,6 +22,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.batch <= 0:
+        raise ValueError("--batch must be positive")
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     model = YOLO(args.weights)
@@ -27,7 +32,7 @@ def main():
         model.export(
             format="onnx",
             imgsz=args.imgsz,
-            batch=1,
+            batch=args.batch,
             dynamic=False,
             simplify=True,
             opset=args.opset,
@@ -37,7 +42,8 @@ def main():
     if exported.resolve() != args.output.resolve():
         shutil.move(str(exported), str(args.output))
 
-    print("Exported ONNX model to {}".format(args.output))
+    print("Exported ONNX model to {} with fixed batch={}".format(
+        args.output, args.batch))
 
 
 if __name__ == "__main__":
