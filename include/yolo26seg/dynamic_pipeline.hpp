@@ -17,7 +17,7 @@ struct CameraFrame {
     int width{0};
     int height{0};
     int stride{0};
-    std::shared_ptr<void> owner; // keeps the Pylon grab result alive
+    std::shared_ptr<void> owner;
 };
 
 struct SegmentationResult {
@@ -26,7 +26,7 @@ struct SegmentationResult {
     float preprocessMs{0.0F};
     float inferenceMs{0.0F};
     float bestScore{0.0F};
-    int bestClass{-1};
+    int bestIndex{-1};
     std::size_t outputValues{0};
 };
 
@@ -37,17 +37,25 @@ public:
         int inputWidth,
         int inputHeight,
         const std::string& inputName,
-        const std::string& primaryOutputName);
+        const std::string& primaryOutputName,
+        const std::vector<std::string>& configuredCameraIds);
 
-    std::vector<SegmentationResult> process(
-        const std::vector<CameraFrame>& readyFrames);
+    // frames must be in the same fixed order as configuredCameraIds.
+    // Exactly one fresh frame per configured camera is required.
+    std::vector<SegmentationResult> processFixedBatch(
+        const std::vector<CameraFrame>& frames);
+
+    int batchSize() const noexcept {
+        return static_cast<int>(cameraIds_.size());
+    }
 
 private:
-    SegmentationResult processOne(const CameraFrame& frame);
     static void basicPostprocess(
-        const std::vector<float>& output,
+        const float* begin,
+        const float* end,
         SegmentationResult& result);
 
+    std::vector<std::string> cameraIds_;
     Yolo26Seg model_;
     std::string primaryOutputName_;
 };
