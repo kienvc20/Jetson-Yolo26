@@ -1,49 +1,82 @@
-# Dynamic Basler -> CUDA -> TensorRT segmentation pipeline
+# Config-driven Basler -> CUDA -> TensorRT segmentation pipeline
 
-This branch adds the first end-to-end camera skeleton without hiding the important ownership boundaries.
+The camera config defines the TensorRT batch size and the permanent mapping between camera serial numbers and batch slots.
 
-## Current data flow
+## Camera config
+
+Example `configs/basler_cameras.example.txt`:
 
 ```text
-Basler cameras discovered at startup
-        |
-        | RetrieveResult(0, Return)
-        v
-CGrabResultPtr -- GetBuffer() --> Pylon host buffer (no GetBuffer copy)
-        |                            |
-        | shared owner              | cudaMemcpyAsync
-        |                            v
-        +----------------------> CUDA device buffer
-                                     |
-                                     v
-                         fused CUDA preprocess
-                         BGR8 -> letterbox -> RGB
-                         -> normalize -> NCHW FP16/FP32
-                                     |
-                                     v
-                              TensorRT model
-                                     |
-                                     v
-                         basic CPU postprocess
+40123456
+40123457
+40123458
+40123459
 ```
 
-## Dynamic camera behavior
+This means:
 
-Every scheduling cycle polls every active camera with a zero timeout. Only cameras with a fresh successful grab are placed in `readyFrames`. A slow camera therefore does not block a fast camera.
+```text
+batch_size = 4
+batch[0] = camera 40123456
+batch[1] = camera 40123457
+batch[2] = camera 40123458
+batch[3] = camera 40123459
+```
 
-This is *dynamic camera scheduling*, not yet true TensorRT dynamic batching. The repository's current engine contract is batch 1. `DynamicSegPipeline` intentionally isolates the batching boundary so the next step can replace the per-frame loop with a `[N,3,H,W]` batch once the engine is exported/built with a dynamic `N` optimization profile.
+The runtime requires all configured cameras to be present at startup. The order in the config is preserved all the way through preprocessing, TensorRT and postprocess.
 
-## Pixel format
+## Data flow
 
-The sample expects the Basler camera to deliver `BGR8`. `frame.stride = width * 3` is therefore deliberate and must be replaced with the actual stride/padding if the selected camera format differs. Production code should configure/check `PixelFormat` explicitly rather than assuming it.
+```text
+configured Cam0 -> latest frame -> batch slot 0 --\
+configured Cam1 -> latest frame -> batch slot 1 ---\
+configured Cam2 -> latest frame -> batch slot 2 ----> async H2D
+configured Cam3 -> latest frame -> batch slot 3 ---/       |
+                                                         GPU
+                                                          |
+                                  CUDA preprocess into [N,3,H,W]
+                                  letterbox + BGR->RGB
+                                  normalize + HWC->CHW
+                                                          |
+                                                          v
+                                               one TensorRT enqueueV2()
+                                                          |
+                                                          v
+                                                batched model outputs
+                                                          |
+                                                          v
+                                             split result by batch slot
+```
 
-## Lifetime
+`GetBuffer()` does not copy. `CameraFrame::owner` retains the `CGrabResultPtr` until the batch upload/inference path has consumed the host data.
 
-Never queue only `grab->GetBuffer()`. The pointer belongs to a Pylon grab buffer. `CameraFrame::owner` holds a `shared_ptr<CGrabResultPtr>` so the grab result remains referenced until GPU upload/inference has consumed the host data.
+## Scheduling policy
+
+Each configured camera owns exactly one slot. Capture uses `GrabStrategy_LatestImageOnly`; while waiting for the slowest camera, a faster camera replaces its cached slot with its newest frame instead of building an unbounded queue.
+
+A batch is submitted only when every configured slot has received a fresh frame. After inference all slots are marked non-fresh, so the next batch requires one new frame from every camera.
+
+This deliberately makes throughput bounded by the slowest configured camera. A timeout/reuse/invalid-slot policy can be added later if lower latency is more important than one-new-frame-per-camera semantics.
+
+## Engine batch must match config
+
+The ONNX/TensorRT engine must be exported with the same static batch size as the number of configured cameras. For four cameras:
+
+```bash
+python scripts/export_onnx.py \
+  --weights yolo26n-seg.pt \
+  --imgsz 512 \
+  --batch 4 \
+  --output models/yolo26n-seg-b4.onnx
+
+./scripts/build_engine.sh \
+  models/yolo26n-seg-b4.onnx \
+  models/yolo26n-seg-b4.engine
+```
+
+At runtime `Yolo26Seg` requests `[4,3,512,512]`. A static batch-1 engine will fail early instead of silently running four sequential inferences.
 
 ## Build
-
-Install CUDA/TensorRT and Basler pylon, then:
 
 ```bash
 cmake -S . -B build \
@@ -57,34 +90,40 @@ Run:
 
 ```bash
 ./build/basler_dynamic_seg \
-  models/yolo26n-seg.engine \
-  512 512 images output0
+  models/yolo26n-seg-b4.engine \
+  512 512 images output0 \
+  configs/basler_cameras.txt
 ```
 
-Use the actual input/output binding names reported by your engine.
+Use the actual input/output binding names reported by the engine.
+
+## GPU preprocessing
+
+Each host frame is copied asynchronously into a shared CUDA staging allocation. `launchPreprocessBatchSlot()` writes directly into its destination NCHW batch offset:
+
+```text
+slot 0 -> input + 0 * (3*H*W)
+slot 1 -> input + 1 * (3*H*W)
+...
+```
+
+There is no intermediate per-camera normalized tensor and only one TensorRT enqueue for the full configured batch.
+
+## Pixel format
+
+The sample currently assumes tightly packed `BGR8`, therefore `stride = width * 3`. Production code should explicitly configure/check Basler `PixelFormat` and actual row stride/padding.
 
 ## Postprocess status
 
-The current postprocess is intentionally only a smoke test: it downloads one FP32 output and reports its maximum value/index. It is not pretending that an unknown output index is a YOLO class.
+The current postprocess remains intentionally model-agnostic. It downloads the configured FP32 primary output, divides the first/batch dimension into equal per-camera slices, and reports a maximum value/index for each slot.
 
-Before implementing real YOLO26 segmentation postprocess, inspect the exact engine outputs and lock down:
+It does not pretend to implement YOLO26 segmentation semantics before the exact engine output contract is known. Real postprocess still needs detection decode, confidence filtering, NMS, mask coefficients, prototype reconstruction, crop/resize and thresholding.
 
-- detection tensor layout
-- class score layout
-- mask coefficient layout
-- prototype mask tensor layout
-- whether NMS is inside or outside the engine
+## Next optimization steps
 
-Then implement decode -> confidence filtering -> NMS -> mask coefficient x prototypes -> crop/resize/threshold.
-
-## Next optimization milestone
-
-1. Configure BGR8 and actual stride explicitly through pylon.
-2. Use registered/pinned host buffers where the pylon transport path permits it.
-3. Build TensorRT engine with dynamic batch `N=1..max_cameras`.
-4. Preallocate one maximum-size input tensor.
-5. Launch CUDA preprocessing into batch offsets.
-6. Set TensorRT binding dimensions to current ready-frame count.
-7. Enqueue one inference for the whole ready batch.
-8. Move YOLO decode and mask reconstruction to CUDA.
-9. Add bounded latest-frame queues/hotplug rediscovery if runtime camera attach/detach is required.
+1. Configure/check BGR8 and stride through pylon.
+2. Register/use pinned host capture buffers where the transport path permits it.
+3. Give camera uploads separate CUDA streams if profiling shows H2D serialization matters.
+4. Move YOLO decode/NMS/mask reconstruction to CUDA.
+5. Add timestamp skew metrics between batch slots.
+6. Add a configurable missing-camera deadline policy if waiting for every fresh frame is too costly.
